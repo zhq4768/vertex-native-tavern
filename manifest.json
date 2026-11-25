@@ -1,6 +1,6 @@
 {
   "display_name": "Vertex 原生正文传输",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "loading_order": 110,
   "requires": [],
   "optional": [],

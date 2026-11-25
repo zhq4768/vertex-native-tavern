@@ -279,7 +279,7 @@ function createDecoder(settings) {
       if (stopped) {
         finish = "STOP";
         return { data: { candidates: [{ index: 0, finishReason: "STOP", content: { role: "model", parts } }] },
-          end: true, status: "已按完整标签截停，末包用量可能缺失" };
+          tagStopped: true };
       }
       if (canContinue && ["MAX_TOKENS", "MALFORMED_FUNCTION_CALL", "CONTINUATION"].includes(reason)) {
         const prefix = body.slice(segmentStart).some(text => text.trim()) ? body.join("") : "";
@@ -321,15 +321,29 @@ export function restoreNativeStream(response, settings, notify = () => {}, conti
   const encoder = new TextEncoder();
   const receive = createDecoder(settings);
   let incoming = "", ended = false, pendingPrefix = "";
+  let tagStopped = false, receivedStopUsage = false, upstreamFinish, usageSeen = false;
   let retryState = continuation?.retryState;
   let responseHeaders = response.headers;
+  const report = continuation?.report ?? (() => {});
   const event = value => encoder.encode("data: " + (typeof value === "string" ? value : JSON.stringify(value)) + "\n\n");
-  async function stop(controller, status) {
+  async function stop(controller, status, outcome, fields = {}) {
     ended = true;
     notify(status);
+    report("end", { outcome, usageSeen, ...fields });
     controller.enqueue(event("[DONE]"));
     controller.close();
     try { await reader.cancel(); } catch {}
+  }
+  function finishTagged(controller) {
+    if (settings.waitForStopUsage === true) {
+      controller.enqueue(event({ candidates: [{ index: 0, finishReason: "STOP", content: { role: "model", parts: [] } }] }));
+    }
+    return stop(controller, receivedStopUsage ? "已按标签截停，已收到上游用量" : "已按标签截停，未收到后续用量",
+      "tag-stop", { finishReason: upstreamFinish, usageAfterTag: receivedStopUsage });
+  }
+  function finishStream(controller) {
+    return tagStopped ? finishTagged(controller)
+      : stop(controller, receive.complete(), "finished", { finishReason: upstreamFinish });
   }
   async function attach(next) {
     if (!ended) next = await retryHttp(next, retryState);
@@ -351,6 +365,7 @@ export function restoreNativeStream(response, settings, notify = () => {}, conti
     pendingPrefix = "";
     try { await reader.cancel(); } catch {}
     if (ended) return;
+    upstreamFinish = undefined;
     receive.nextSegment(prefix);
     retryState.attempts = 0;
     await attach(await continuation.open(prefix));
@@ -364,7 +379,7 @@ export function restoreNativeStream(response, settings, notify = () => {}, conti
             const { value, done } = await reader.read();
             if (ended) return;
             if (done) {
-              if (!pendingPrefix) return stop(controller, receive.complete());
+              if (!pendingPrefix) return finishStream(controller);
               await openNext();
               continue;
             }
@@ -376,13 +391,29 @@ export function restoreNativeStream(response, settings, notify = () => {}, conti
           const data = block.split(/\r?\n/).filter(l => l.startsWith("data:")).map(l => l.slice(5).trimStart()).join("\n");
           if (!data) continue;
           if (data.trim() === "[DONE]") {
-            if (!pendingPrefix) return stop(controller, receive.complete());
+            if (!pendingPrefix) return finishStream(controller);
             await openNext();
             continue;
           }
           const parsed = JSON.parse(data);
+          const reason = parsed.candidates?.[0]?.finishReason;
+          if (terminal.has(reason) || ["CONTINUATION", "MALFORMED_FUNCTION_CALL"].includes(reason)) upstreamFinish = reason;
           const status = transientStatus(parsed);
+          if (tagStopped) {
+            if (status || parsed.error || parsed.promptFeedback?.blockReason ||
+                parsed.candidates?.[0]?.content?.parts?.some(part => apiErrorLabel.test(part.text || ""))) {
+              report("upstream-error", status ? { status } : {});
+              return finishTagged(controller);
+            }
+            if (object(parsed.usageMetadata)) {
+              receivedStopUsage = usageSeen = true;
+              controller.enqueue(event({ usageMetadata: parsed.usageMetadata }));
+              return;
+            }
+            continue;
+          }
           if (status) {
+            report("upstream-error", { status });
             if (pendingPrefix) {
               await openNext();
               continue;
@@ -402,22 +433,48 @@ export function restoreNativeStream(response, settings, notify = () => {}, conti
           const restored = receive.frame(parsed, continuation?.available());
           if (restored.prefix) pendingPrefix = restored.prefix;
           else if (terminal.has(restored.data.candidates?.[0]?.finishReason)) pendingPrefix = "";
+          if (!restored.end && restored.data.candidates?.[0]?.content?.parts?.some(part =>
+              typeof part.text === "string" && part.text.length && !part.thought)) report("text");
+          if (object(parsed.usageMetadata)) usageSeen = true;
+          if (restored.tagStopped) {
+            pendingPrefix = "";
+            tagStopped = true;
+            receivedStopUsage = object(parsed.usageMetadata);
+            report("tag-stop");
+            const { candidates } = restored.data;
+            const [{ finishReason, ...visible }] = candidates;
+            if (settings.waitForStopUsage === true) {
+              // Leave the UI stream open, but never forward the hidden tail or its history snapshot.
+              controller.enqueue(event({ candidates: [visible] }));
+              if (receivedStopUsage) controller.enqueue(event({ usageMetadata: parsed.usageMetadata }));
+              notify("正文已按标签截停，等待 Google 结束并回报用量");
+              return;
+            }
+            controller.enqueue(event({ ...restored.data, ...(receivedStopUsage ? { usageMetadata: parsed.usageMetadata } : {}) }));
+            return finishTagged(controller);
+          }
           controller.enqueue(event(restored.data));
-          if (restored.end) await stop(controller, restored.status);
+          if (restored.end) await stop(controller, restored.status, parsed.promptFeedback?.blockReason ? "blocked" : "upstream-error",
+            { finishReason: upstreamFinish });
           return;
         }
       } catch (error) {
         if (ended) return;
         if (error?.name === "AbortError") {
-          await stop(controller, "Vertex 生成已取消");
+          await stop(controller, "Vertex 生成已取消", "cancelled");
           return;
         }
+        if (tagStopped) {
+          report("tail-error");
+          return finishTagged(controller);
+        }
         controller.enqueue(event({ error: { code: "vertex_text_transport", message: error.message } }));
-        await stop(controller, error.message);
+        await stop(controller, error.message, "stream-error", { finishReason: upstreamFinish });
       }
     },
     cancel(reason) {
       ended = true;
+      report("end", { outcome: "cancelled", usageSeen });
       continuation?.cancel(reason);
       return reader.cancel(reason);
     },
@@ -428,7 +485,8 @@ export function restoreNativeStream(response, settings, notify = () => {}, conti
   return new Response(stream, { status: response.status, headers });
 }
 
-export function vertexFetch(originalFetch, readSettings, notify = () => {}, origin = location.origin) {
+export function vertexFetch(originalFetch, readSettings, notify = () => {}, origin = location.origin, onDiagnostic = () => {}) {
+  let sequence = 0;
   return async (input, init) => {
     const settings = readSettings();
     if (!settings.enabled) return originalFetch(input, init);
@@ -444,18 +502,40 @@ export function vertexFetch(originalFetch, readSettings, notify = () => {}, orig
     let payload;
     try { payload = await request.clone().json(); } catch { return originalFetch(request); }
     const prepared = object(payload) && prepareNativeRequest(payload, settings);
-    if (!prepared) return originalFetch(request);
+    if (payload?.chat_completion_source !== "vertexai") return originalFetch(request);
+    const started = performance.now();
+    const diagnostic = { request: ++sequence, startedAt: new Date().toISOString(), outcome: "running", events: [] };
+    let segments = 0;
+    function report(stage, fields = {}) {
+      if (diagnostic.outcome !== "running") return;
+      const elapsedMs = Math.round(performance.now() - started);
+      if (stage === "text") {
+        if (diagnostic.firstTextMs !== undefined) return;
+        diagnostic.firstTextMs = elapsedMs;
+      }
+      if (stage === "end") Object.assign(diagnostic, { elapsedMs }, fields);
+      diagnostic.events.push({ stage, elapsedMs, segment: segments || 1, ...fields });
+      if (diagnostic.events.length > 40) diagnostic.events.shift();
+      onDiagnostic({ ...diagnostic, events: [...diagnostic.events] });
+    }
+    if (!prepared) {
+      report("end", { outcome: "native-passthrough" });
+      return originalFetch(request);
+    }
     const headers = new Headers(request.headers);
     headers.delete("content-length");
-    const send = (payload, signal) => {
+    const send = async (payload, signal) => {
       const options = { headers, body: JSON.stringify(payload), ...(signal ? { signal } : {}) };
-      return input instanceof Request
+      report("request");
+      const response = await (input instanceof Request
         ? originalFetch(new Request(request, options))
-        : originalFetch(input, { ...init, ...options });
+        : originalFetch(input, { ...init, ...options }));
+      report("http", { status: response.status });
+      return response;
     };
     const added = JSON.parse(prepared.custom_include_body);
     const originalBudget = added.generationConfig?.maxOutputTokens ?? prepared.max_tokens;
-    let remaining = originalBudget, segments = 0;
+    let remaining = originalBudget;
     const cancel = new AbortController();
     const segmented = Number.isSafeInteger(originalBudget) && originalBudget > 65536;
     const makeSegment = prefix => {
@@ -479,16 +559,29 @@ export function vertexFetch(originalFetch, readSettings, notify = () => {}, orig
       ? settings.retrySeconds : resumeRetryDefaults.retrySeconds;
     const retryState = { count: retryCount, seconds: retrySeconds, attempts: 0,
       retry: async (delay, status, attempt) => {
+        report("retry", { status, attempt, maxAttempts: retryCount, waitMs: delay });
         notify(`Vertex 第 ${segments || 1} 段遇到 ${status}，${Math.round(delay / 100) / 10} 秒后重试（${attempt}/${retryCount}）`);
         await waitForRetry(delay, continuationSignal);
         continuationSignal.throwIfAborted();
         return send(nextPayload, continuationSignal);
       },
     };
-    const response = await retryHttp(await send(nextPayload), retryState);
-    if (!response.ok) notify("上游 HTTP " + response.status);
+    let response;
+    try {
+      response = await retryHttp(await send(nextPayload), retryState);
+    } catch (error) {
+      report("end", { outcome: continuationSignal.aborted ? "cancelled" : "network-error" });
+      throw error;
+    }
+    if (!response.ok) {
+      notify("上游 HTTP " + response.status);
+      report("end", { outcome: "http-error", status: response.status });
+    } else if (!response.body || !response.headers.get("content-type")?.includes("text/event-stream")) {
+      report("end", { outcome: "non-stream-response", status: response.status });
+    }
     return restoreNativeStream(response, settings, notify, {
       retryState,
+      report,
       available: () => segmented && remaining > 0 && segments < maxSegments && !continuationSignal.aborted,
       open: prefix => {
         continuationSignal.throwIfAborted();

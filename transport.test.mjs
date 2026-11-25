@@ -276,6 +276,61 @@ test("tag stop keeps the closing tag and cancels the source", async () => {
   assert.ok(cancelled);
 });
 
+test("optional tag stop shows the cut immediately and drains only usage from the same request", async () => {
+  let source, calls = 0;
+  const encoder = new TextEncoder();
+  const send = value => source.enqueue(encoder.encode(encode(value)));
+  const reports = [];
+  const wrapper = vertexFetch(async () => {
+    calls++;
+    return new Response(new ReadableStream({ start(controller) { source = controller; } }), {
+      headers: { "content-type": "text/event-stream" },
+    });
+  }, () => ({ ...config, tag: "A", waitForStopUsage: true }), undefined, origin, record => reports.push(record));
+  const response = await wrapper(route, { method: "POST", body: JSON.stringify(request) });
+  const reader = response.body.getReader();
+  send(frame([tool("<A>保留</A>尾巴", true)]));
+  const first = new TextDecoder().decode((await reader.read()).value);
+  assert.equal(visible(first), "<A>保留</A>");
+  assert.doesNotMatch(first, /STOP|\[DONE\]/);
+  const usageMetadata = { promptTokenCount: 17, candidatesTokenCount: 20, totalTokenCount: 37 };
+  send({ ...frame([tool("还在生成", false)], "MAX_TOKENS"), usageMetadata });
+  send({ choices: [{ delta: { native: { gemini: { content: { parts: [{ text: "隐藏历史" }] } } } } }] });
+  send("[DONE]");
+  let tail = "";
+  for (let chunk = await reader.read(); !chunk.done; chunk = await reader.read()) tail += new TextDecoder().decode(chunk.value);
+  assert.equal(visible(tail), "");
+  assert.doesNotMatch(tail, /还在生成|隐藏历史|"native"/);
+  assert.deepEqual(JSON.parse(tail.split("\n")[0].slice(6)), { usageMetadata });
+  assert.match(tail, /"finishReason":"STOP"[\s\S]*\[DONE\]/);
+  assert.equal(calls, 1);
+  assert.equal(reports.at(-1).outcome, "tag-stop");
+  assert.equal(reports.at(-1).usageAfterTag, true);
+  assert.equal(reports.at(-1).finishReason, "MAX_TOKENS");
+});
+
+test("recent-request diagnostics report attempts and first text without recording payloads or error text", async () => {
+  let calls = 0;
+  const reports = [];
+  const wrapper = vertexFetch(async () => {
+    if (++calls === 1) return upstream({ error: { code: 429, message: "private upstream message" } });
+    return upstream(frame([tool("private reply", false)], "STOP"));
+  }, () => ({ ...config, retryCount: 1, retrySeconds: 0 }), undefined, origin, record => reports.push(record));
+  const run = input => wrapper(route, { method: "POST", headers: { Authorization: "Bearer private-key" }, body: JSON.stringify(input) });
+  const response = await run({ ...request, messages: [{ role: "user", content: "private prompt" }] });
+  await response.text();
+  const record = reports.at(-1);
+  assert.equal(record.outcome, "finished");
+  assert.equal(record.finishReason, "STOP");
+  assert.ok(Number.isInteger(record.firstTextMs));
+  assert.deepEqual(record.events.map(item => item.stage), ["request", "http", "upstream-error", "retry", "request", "http", "text", "end"]);
+  assert.deepEqual(record.events.filter(item => item.stage === "retry").map(({ status, attempt, waitMs }) => [status, attempt, waitMs]), [[429, 1, 0]]);
+  assert.doesNotMatch(JSON.stringify(reports), /private|Bearer/);
+  await run({ ...request, enable_web_search: true });
+  assert.equal(reports.at(-1).outcome, "native-passthrough");
+  assert.equal(reports.at(-1).request, 2);
+});
+
 test("missing terminal, unresolved continuation and malformed call remain errors", async () => {
   for (const reason of [undefined, "CONTINUATION", "MALFORMED_FUNCTION_CALL", "STOP"]) {
     const output = await restoreNativeStream(upstream(frame([tool("partial", true)], reason)), config).text();
