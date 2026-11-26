@@ -113,7 +113,7 @@ export function prepareNativeRequest(body, settings) {
   if (!object(added) || ("generationConfig" in added && !object(added.generationConfig)) ||
       "tools" in added || "toolConfig" in added || "tool_config" in added || "continuationToken" in added ||
       ["candidateCount", "responseSchema", "responseJsonSchema", "responseMimeType"].some(k => k in (added.generationConfig || {}))) return null;
-  const instruction = "Deliver the requested visible reply through vertex_deliver_text. Its content field contains the reply itself. Preserve the requested language and formatting. Finish the call once the reply is complete.";
+  const instruction = `Deliver the requested visible reply through ${toolName}. Its content field contains the reply itself. Preserve the requested language and formatting. Finish the call once the reply is complete.`;
   const messages = [...body.messages];
   const last = messages.at(-1);
   if (last?.role === "user" && typeof last.content === "string") {
@@ -546,10 +546,11 @@ export function vertexFetch(originalFetch, readSettings, notify = () => {}, orig
       const budget = Math.min(remaining, segmentBudget);
       remaining -= budget;
       segments++;
-      const messages = prefix ? [...prepared.messages, {
-        role: "user",
-        content: "根据原始任务、角色设定和预设格式，在以下已发送正文的末尾接着写。接上未完的句子、段落或标签，从断点直接输出新增正文。正文继续通过 vertex_deliver_text 工具的 content 参数交付。\n\n" + prefix,
-      }] : prepared.messages;
+      const messages = prefix ? [
+        ...prepared.messages,
+        { role: "assistant", content: prefix },
+        { role: "user", content: `从上一条正文的最后一个字接着写，保持原来的语言和格式。请调用一次 ${toolName}，把新增正文放进 content，写完即结束调用。` },
+      ] : prepared.messages;
       const custom = added.generationConfig?.maxOutputTokens === undefined
         ? prepared.custom_include_body
         : JSON.stringify({ ...added, generationConfig: { ...added.generationConfig, maxOutputTokens: budget } });

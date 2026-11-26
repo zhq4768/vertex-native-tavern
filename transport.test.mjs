@@ -120,11 +120,18 @@ test("native v1 chains short requests with the original messages, tool and compl
     assert.equal(added.generationConfig.maxOutputTokens, entry.max_tokens);
     assert.equal(added.generationConfig.temperature, 0.8);
     assert.deepEqual(added.tools, JSON.parse(sent[0].custom_include_body).tools);
+    assert.deepEqual(added.toolConfig, JSON.parse(sent[0].custom_include_body).toolConfig);
     if (i) {
-      assert.deepEqual(entry.messages.slice(0, -1), sent[0].messages);
-      assert.ok(entry.messages.at(-1).content.endsWith(i === 1 ? first : first + second));
+      assert.deepEqual(entry.messages.slice(0, -2), sent[0].messages);
+      assert.deepEqual(entry.messages.at(-2), { role: "assistant", content: i === 1 ? first : first + second });
+      assert.equal(entry.messages.at(-1).role, "user");
+      assert.match(entry.messages.at(-1).content, /vertex_deliver_text.*content/);
+      assert.ok(!entry.messages.at(-1).content.includes(first));
     }
   }
+  assert.deepEqual(sent[0].messages, prepareNativeRequest({
+    ...request, messages: [{ role: "system", content: "Preset" }, ...request.messages],
+  }, config).messages);
 });
 
 test("503 on a follow-up retries the exact segment and leaves the budget and later segments intact", async () => {
