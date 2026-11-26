@@ -346,3 +346,15 @@ test("Google length and filter statuses pass through", async () => {
     assert.doesNotMatch(output, /"error":/);
   }
 });
+
+test("a complete final event without a blank separator still delivers finish and usage", async () => {
+  const usageMetadata = { candidatesTokenCount: 5, totalTokenCount: 11 };
+  const response = new Response(encode(frame([tool("正文", true)])) +
+    `data: ${JSON.stringify({ ...frame([tool("完成", false)], "STOP"), usageMetadata })}`,
+  { headers: { "content-type": "text/event-stream" } });
+  const output = await restoreNativeStream(response, config).text();
+  assert.equal(visible(output), "正文完成");
+  assert.match(output, /"finishReason":"STOP"/);
+  assert.match(output, /"totalTokenCount":11/);
+  assert.doesNotMatch(output, /"error":/);
+});

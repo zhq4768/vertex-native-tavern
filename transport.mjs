@@ -320,7 +320,7 @@ export function restoreNativeStream(response, settings, notify = () => {}, conti
   let decoder = new TextDecoder();
   const encoder = new TextEncoder();
   const receive = createDecoder(settings);
-  let incoming = "", ended = false, pendingPrefix = "";
+  let incoming = "", sourceDone = false, ended = false, pendingPrefix = "";
   let tagStopped = false, receivedStopUsage = false, upstreamFinish, usageSeen = false;
   let retryState = continuation?.retryState;
   let responseHeaders = response.headers;
@@ -359,6 +359,7 @@ export function restoreNativeStream(response, settings, notify = () => {}, conti
     responseHeaders = next.headers;
     decoder = new TextDecoder();
     incoming = "";
+    sourceDone = false;
   }
   async function openNext() {
     const prefix = pendingPrefix;
@@ -376,14 +377,17 @@ export function restoreNativeStream(response, settings, notify = () => {}, conti
         while (!ended) {
           const separator = /\r?\n\r?\n/.exec(incoming);
           if (!separator) {
-            const { value, done } = await reader.read();
-            if (ended) return;
-            if (done) {
+            if (sourceDone) {
               if (!pendingPrefix) return finishStream(controller);
               await openNext();
               continue;
             }
-            incoming += decoder.decode(value, { stream: true });
+            const { value, done } = await reader.read();
+            if (ended) return;
+            sourceDone = done;
+            incoming += decoder.decode(value, { stream: !done });
+            // Some TauriTavern bridges close immediately after the final data line.
+            if (done && incoming.trim()) incoming += "\n\n";
             continue;
           }
           const block = incoming.slice(0, separator.index);

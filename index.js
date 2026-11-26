@@ -81,7 +81,7 @@ if (globalThis.__TAURITAVERN__ && context && !globalThis[registered]) {
     let pinned;
     function showRecord() {
       const record = recent.get(Number(requestList.value));
-      log.textContent = record ? JSON.stringify({ extensionVersion: "0.1.7", ...record }, null, 2) : "暂无请求";
+      log.textContent = record ? JSON.stringify({ extensionVersion: "0.1.8", ...record }, null, 2) : "暂无请求";
       copy.disabled = !record;
     }
     refreshRecent = () => {
